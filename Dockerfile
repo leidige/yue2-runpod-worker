@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir torch==2.10.0 torchaudio==2.10.0 \
+    && pip install --no-cache-dir \
+        torch==2.10.0 torchaudio==2.10.0 torchvision==0.25.0 \
         --index-url https://download.pytorch.org/whl/cu128
 
 COPY builder/requirements.txt /app/requirements.txt
