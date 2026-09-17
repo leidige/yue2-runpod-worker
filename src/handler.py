@@ -62,6 +62,19 @@ def ffmpeg_to_mp3(src: str, dst: str) -> None:
     )
 
 
+def _compat_transformers_exports():
+    """SheetSage2 imports PreTrainedModel via lazy transformers; warm real symbols first."""
+    import transformers
+    from transformers.modeling_utils import PreTrainedModel
+    from transformers.models.auto import AutoModel
+    from transformers.models.bart.configuration_bart import BartConfig
+
+    setattr(transformers, "PreTrainedModel", PreTrainedModel)
+    setattr(transformers, "BartConfig", BartConfig)
+    setattr(transformers, "AutoModel", AutoModel)
+    return AutoModel
+
+
 def ensure_models():
     global _pipe, _transcriber
     with _lock:
@@ -69,13 +82,21 @@ def ensure_models():
             return _pipe, _transcriber
 
         import torch
-        from transformers import AutoModel
         from yue2 import YuE2Pipeline
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available on this worker")
         if not torch.cuda.is_bf16_supported():
             raise RuntimeError("GPU does not support BF16")
+
+        # SheetSage2 (remote code) before YuE2 — YuE2 custom modules can break
+        # transformers lazy imports that SheetSage2 still uses (4.45-style).
+        AutoModel = _compat_transformers_exports()
+        log(f"loading SheetSage2 {TRANSCRIBER_ID}")
+        _transcriber = AutoModel.from_pretrained(
+            TRANSCRIBER_ID,
+            trust_remote_code=True,
+        ).eval().to("cuda")
 
         log(f"loading YuE2 pipeline {MODEL_ID}")
         _pipe = YuE2Pipeline.from_pretrained(
@@ -84,11 +105,6 @@ def ensure_models():
             backend="torch",
             progress=True,
         )
-        log(f"loading SheetSage2 {TRANSCRIBER_ID}")
-        _transcriber = AutoModel.from_pretrained(
-            TRANSCRIBER_ID,
-            trust_remote_code=True,
-        ).eval().to("cuda")
         log("models ready")
         return _pipe, _transcriber
 
