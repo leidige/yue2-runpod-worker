@@ -1,47 +1,175 @@
-import os, json, tempfile, subprocess, requests
+import base64
+import os
+import subprocess
+import tempfile
+import threading
+import traceback
+from dataclasses import replace
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
 import runpod
 
-# TODO: 你需要在这里接入 YuE2 的实际推理调用
-# 目前先把流程打通：下载输入音频 -> 返回原音频(占位)。
-# 等你贴 YuE2 仓库的 cover 推理命令/函数入口后，我再把这里替换成真实生成。
+DOWNLOAD_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; yue2-runpod-worker/1.0)",
+}
+MAX_AUDIO_BYTES = 80 * 1024 * 1024
+MODEL_ID = os.environ.get("YUE2_MODEL", "m-a-p/YuE2-3B")
+TRANSCRIBER_ID = os.environ.get("SHEETSAGE_MODEL", "m-a-p/SheetSage2")
 
-def download_to_file(url: str, suffix: str):
-    r = requests.get(url, stream=True, timeout=120)
-    r.raise_for_status()
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
+_lock = threading.Lock()
+_pipe = None
+_transcriber = None
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def download_to_file(url: str, suffix: str) -> str:
+    with requests.get(url, stream=True, timeout=180, headers=DOWNLOAD_HEADERS) as r:
+        r.raise_for_status()
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        written = 0
+        with os.fdopen(fd, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > MAX_AUDIO_BYTES:
+                    raise ValueError(f"audio_url exceeds {MAX_AUDIO_BYTES} bytes")
                 f.write(chunk)
     return path
 
+
+def suffix_from_url(url: str) -> str:
+    ext = Path(urlparse(url).path).suffix.lower()
+    if ext in {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm"}:
+        return ext
+    return ".wav"
+
+
+def ffmpeg_to_mp3(src: str, dst: str) -> None:
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", src, "-codec:a", "libmp3lame", "-b:a", "192k", dst,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def ensure_models():
+    global _pipe, _transcriber
+    with _lock:
+        if _pipe is not None and _transcriber is not None:
+            return _pipe, _transcriber
+
+        import torch
+        from transformers import AutoModel
+        from yue2 import YuE2Pipeline
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available on this worker")
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("GPU does not support BF16")
+
+        log(f"loading YuE2 pipeline {MODEL_ID}")
+        _pipe = YuE2Pipeline.from_pretrained(
+            MODEL_ID,
+            device="cuda",
+            backend="torch",
+            progress=True,
+        )
+        log(f"loading SheetSage2 {TRANSCRIBER_ID}")
+        _transcriber = AutoModel.from_pretrained(
+            TRANSCRIBER_ID,
+            trust_remote_code=True,
+        ).eval().to("cuda")
+        log("models ready")
+        return _pipe, _transcriber
+
+
+def transcribe_melody(audio_path: str) -> str:
+    _, transcriber = ensure_models()
+    log(f"transcribing melody from {audio_path}")
+    result = transcriber.transcribe(audio_path, melody_only=True)
+    abc = (result or {}).get("abc") if isinstance(result, dict) else None
+    if not abc or not str(abc).strip():
+        raise RuntimeError("SheetSage2 did not produce melody ABC")
+    return str(abc)
+
+
+def generate_cover(style: str, lyrics: str, abc: str, seed: int, ode_steps: int, cot: str):
+    pipe, _ = ensure_models()
+    original = pipe.generation_config
+    pipe.generation_config = replace(original, ode_steps=int(ode_steps))
+    try:
+        log(f"generating cover cot={cot} seed={seed} ode_steps={ode_steps}")
+        return pipe(style=style, lyrics=lyrics, abc=abc, cot=cot, seed=int(seed))
+    finally:
+        pipe.generation_config = original
+
+
 def handler(event):
     inp = event.get("input", {}) or {}
-
-    audio_url = inp.get("audio_url")
-    style_prompt = inp.get("style_prompt", "")
-    lyrics = inp.get("lyrics", "")
-
-    if not audio_url:
-        return {"error": "Missing input.audio_url"}
-
-    in_audio = download_to_file(audio_url, suffix=".wav")
-
-    # 验证 ffmpeg/依赖是否存在（防止你上次那种“部署了但跑不起来”）
     try:
-        subprocess.check_output(["ffmpeg", "-version"])
+        if inp.get("warmup"):
+            ensure_models()
+            return {"ok": True, "warm": True}
+
+        audio_url = inp.get("audio_url")
+        abc = (inp.get("abc") or "").strip()
+        style = (inp.get("style") or inp.get("style_prompt") or "").strip()
+        lyrics = (inp.get("lyrics") or "").strip()
+        cot = (inp.get("cot") or "melody").strip()
+        seed = int(inp.get("seed", 831001))
+        ode_steps = int(inp.get("ode_steps", 16))
+
+        if not style:
+            return {"error": "Missing input.style or input.style_prompt"}
+        if not lyrics:
+            return {"error": "Missing input.lyrics"}
+        if cot not in {"melody", "full", "off"}:
+            return {"error": "input.cot must be melody, full, or off"}
+        if not abc and not audio_url:
+            return {"error": "Provide input.audio_url or input.abc"}
+        if len(style) > 1000:
+            return {"error": "style must be <= 1000 characters"}
+        if len(lyrics) > 12000:
+            return {"error": "lyrics must be <= 12000 characters"}
+
+        in_audio = None
+        if not abc:
+            in_audio = download_to_file(audio_url, suffix_from_url(audio_url))
+            abc = transcribe_melody(in_audio)
+
+        song = generate_cover(style, lyrics, abc, seed, ode_steps, cot)
+
+        work = Path(tempfile.mkdtemp(prefix="yue2-cover-"))
+        flac_path = work / "cover.flac"
+        mp3_path = work / "cover.mp3"
+        song.save(str(flac_path))
+        ffmpeg_to_mp3(str(flac_path), str(mp3_path))
+        audio_b64 = base64.b64encode(mp3_path.read_bytes()).decode("ascii")
+
+        return {
+            "ok": True,
+            "audio_base64": audio_b64,
+            "audio_mime": "audio/mpeg",
+            "abc": song.abc or abc,
+            "seed": seed,
+            "cot": cot,
+            "ode_steps": ode_steps,
+            "sample_rate": song.sample_rate,
+            "timing": song.timing,
+        }
     except Exception as e:
-        return {"error": f"ffmpeg not available: {e}"}
+        log("handler failed:\n" + traceback.format_exc())
+        return {"error": str(e)}
 
-    # TODO: 在这里调用 YuE2 cover 推理，输出 out_audio
-    # out_audio = run_yue2_cover(in_audio, style_prompt, lyrics)
-    out_audio = in_audio  # 占位：先回传输入，证明链路OK
-
-    return {
-        "ok": True,
-        "note": "Pipeline placeholder. Replace with YuE2 cover inference.",
-        "inputs_echo": {"style_prompt": style_prompt, "lyrics_len": len(lyrics)},
-        "output_audio_path": out_audio,
-    }
 
 runpod.serverless.start({"handler": handler})
