@@ -74,6 +74,57 @@ def ffmpeg_to_mp3(src: str, dst: str) -> None:
     )
 
 
+def probe_audio_seconds(path: str) -> float | None:
+    """用 ffprobe 读参考成曲时长（秒）。失败返回 None。"""
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        sec = float((out.stdout or "").strip())
+        if sec > 0 and sec < 3600:
+            return sec
+    except Exception as exc:
+        log(f"ffprobe duration failed: {exc}")
+    return None
+
+
+# YuE2 semantic ≈ 25 codec frames/s（社区/MLX 文档常用换算）
+SEMANTIC_FPS = 25.0
+# 上下文上限 24576；给前缀（含 ABC）留余量
+MAX_SEMANTIC_TOKENS = 12000
+
+
+def semantic_bounds_for_duration(seconds: float) -> tuple[int, int]:
+    """按参考时长估算 semantic min/max_tokens，减轻「4 分半变 1 分半」。"""
+    sec = max(30.0, min(float(seconds), 8 * 60.0))
+    target = int(round(sec * SEMANTIC_FPS))
+    # 最低生成约 90% 目标时长，避免过早 MUSIC_END
+    min_tokens = max(800, int(target * 0.90))
+    max_tokens = min(MAX_SEMANTIC_TOKENS, max(min_tokens + 200, int(target * 1.12) + 100))
+    if min_tokens >= max_tokens:
+        min_tokens = max(200, max_tokens - 200)
+    return min_tokens, max_tokens
+
+
+def expand_instrumental_lyrics_for_duration(seconds: float | None) -> str:
+    """空词结构段太少时模型会早停；按时长多铺几段空结构。"""
+    sec = float(seconds or 180.0)
+    # 约每 40s 一段结构骨架
+    n = max(4, min(12, int(round(sec / 40.0))))
+    labels = ["verse", "chorus", "verse", "chorus", "bridge", "chorus", "outro"]
+    blocks: list[str] = []
+    for i in range(n):
+        tag = labels[i % len(labels)]
+        blocks.append(f"[{tag}]\n\n\n\n\n")
+    return "".join(blocks)
+
+
 def _compat_transformers_exports():
     """SheetSage2 imports PreTrainedModel via lazy transformers; warm real symbols first."""
     import transformers
@@ -227,15 +278,13 @@ def generate_cover(
     ode_steps: int,
     cot: str,
     cfg_scale: float | None,
+    *,
+    target_seconds: float | None = None,
 ):
     pipe, _ = ensure_models()
     original = pipe.generation_config
     pipe.generation_config = replace(original, ode_steps=int(ode_steps))
     try:
-        log(
-            f"generating cover cot={cot} seed={seed} ode_steps={ode_steps} "
-            f"cfg_scale={cfg_scale} has_abc={bool(abc and str(abc).strip())}"
-        )
         kwargs = {
             "style": style,
             "lyrics": lyrics,
@@ -246,6 +295,19 @@ def generate_cover(
             kwargs["abc"] = str(abc).strip()
         if cfg_scale is not None:
             kwargs["cfg_scale"] = float(cfg_scale)
+        if target_seconds and target_seconds > 0:
+            from yue2.protocol import Sampling
+
+            min_tok, max_tok = semantic_bounds_for_duration(target_seconds)
+            kwargs["semantic_sampling"] = Sampling(min_tokens=min_tok, max_tokens=max_tok)
+            log(
+                f"duration target={target_seconds:.1f}s -> semantic "
+                f"min_tokens={min_tok} max_tokens={max_tok}"
+            )
+        log(
+            f"generating cover cot={cot} seed={seed} ode_steps={ode_steps} "
+            f"cfg_scale={cfg_scale} has_abc={bool(abc and str(abc).strip())}"
+        )
         return pipe(**kwargs)
     finally:
         pipe.generation_config = original
@@ -312,9 +374,13 @@ def handler(event):
 
         source_abc = abc
         in_audio = None
+        source_seconds: float | None = None
         try:
             if not abc and audio_url:
                 in_audio = download_to_file(audio_url, suffix_from_url(audio_url))
+                source_seconds = probe_audio_seconds(in_audio)
+                if source_seconds:
+                    log(f"reference audio duration={source_seconds:.1f}s")
                 source_abc = transcribe_score(in_audio, melody_only=melody_only)
                 abc = source_abc
             elif not abc and not audio_url:
@@ -324,6 +390,15 @@ def handler(event):
                     log("text2music: no abc/audio, cot melody→full")
                 source_abc = ""
                 abc = ""
+
+            # 可选：调用方直接传目标秒数（无本地文件时）
+            if source_seconds is None:
+                raw_sec = inp.get("target_seconds") or inp.get("source_seconds")
+                if raw_sec not in (None, ""):
+                    try:
+                        source_seconds = float(raw_sec)
+                    except (TypeError, ValueError):
+                        source_seconds = None
 
             instrumental = wants_instrumental(
                 style, lyrics, inp.get("force_instrumental") or inp.get("instrumental")
@@ -336,6 +411,10 @@ def handler(event):
                     abc=abc if abc else None,
                     cfg_scale=cfg_scale,
                 )
+                # 空词段太少 → 时长塌缩；按时长加铺结构
+                lyrics = expand_instrumental_lyrics_for_duration(source_seconds)
+                instrumental_meta["lyrics_expanded_for_duration"] = True
+                instrumental_meta["lyrics_chars"] = len(lyrics)
                 log(f"instrumental cover prepared meta={instrumental_meta}")
 
             song = generate_cover(
@@ -346,6 +425,7 @@ def handler(event):
                 ode_steps,
                 cot,
                 cfg_scale,
+                target_seconds=source_seconds,
             )
 
             work = Path(tempfile.mkdtemp(prefix="yue2-cover-"))
@@ -356,6 +436,12 @@ def handler(event):
             audio_b64 = base64.b64encode(mp3_path.read_bytes()).decode("ascii")
 
             result_abc = getattr(song, "abc", None) or abc
+            out_seconds = None
+            try:
+                out_seconds = float(len(song.audio)) / float(song.sample_rate)
+            except Exception:
+                out_seconds = probe_audio_seconds(str(mp3_path))
+            trunc = getattr(song, "truncated", None)
             return {
                 "ok": True,
                 "action": "cover",
@@ -370,6 +456,9 @@ def handler(event):
                 "melody_only": melody_only,
                 "instrumental": instrumental,
                 "instrumental_meta": instrumental_meta,
+                "source_seconds": source_seconds,
+                "output_seconds": out_seconds,
+                "truncated": trunc,
                 "sample_rate": song.sample_rate,
                 "timing": song.timing,
             }
