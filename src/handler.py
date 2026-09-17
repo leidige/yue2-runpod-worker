@@ -74,6 +74,19 @@ def ffmpeg_to_mp3(src: str, dst: str) -> None:
     )
 
 
+def ffmpeg_to_wav(src: str, dst: str) -> None:
+    """16-bit PCM WAV，便于下载；比 float WAV 更小。"""
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", src, "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", dst,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def probe_audio_seconds(path: str) -> float | None:
     """用 ffprobe 读参考成曲时长（秒）。失败返回 None。"""
     try:
@@ -430,10 +443,17 @@ def handler(event):
 
             work = Path(tempfile.mkdtemp(prefix="yue2-cover-"))
             flac_path = work / "cover.flac"
+            wav_path = work / "cover.wav"
             mp3_path = work / "cover.mp3"
             song.save(str(flac_path))
+            ffmpeg_to_wav(str(flac_path), str(wav_path))
             ffmpeg_to_mp3(str(flac_path), str(mp3_path))
-            audio_b64 = base64.b64encode(mp3_path.read_bytes()).decode("ascii")
+            mp3_bytes = mp3_path.read_bytes()
+            wav_bytes = wav_path.read_bytes()
+            flac_bytes = flac_path.read_bytes()
+            log(
+                f"exports mp3={len(mp3_bytes)} wav={len(wav_bytes)} flac={len(flac_bytes)} bytes"
+            )
 
             result_abc = getattr(song, "abc", None) or abc
             out_seconds = None
@@ -445,8 +465,18 @@ def handler(event):
             return {
                 "ok": True,
                 "action": "cover",
-                "audio_base64": audio_b64,
+                # 试听默认 MP3；无损另附 WAV / FLAC
+                "audio_base64": base64.b64encode(mp3_bytes).decode("ascii"),
                 "audio_mime": "audio/mpeg",
+                "audio_wav_base64": base64.b64encode(wav_bytes).decode("ascii"),
+                "audio_wav_mime": "audio/wav",
+                "audio_flac_base64": base64.b64encode(flac_bytes).decode("ascii"),
+                "audio_flac_mime": "audio/flac",
+                "audio_bytes": {
+                    "mp3": len(mp3_bytes),
+                    "wav": len(wav_bytes),
+                    "flac": len(flac_bytes),
+                },
                 "abc": result_abc,
                 "source_abc": source_abc,
                 "seed": seed,
