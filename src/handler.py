@@ -17,6 +17,8 @@ DOWNLOAD_HEADERS = {
 MAX_AUDIO_BYTES = 80 * 1024 * 1024
 MODEL_ID = os.environ.get("YUE2_MODEL", "m-a-p/YuE2-3B")
 TRANSCRIBER_ID = os.environ.get("SHEETSAGE_MODEL", "m-a-p/SheetSage2")
+# Official GenerationConfig default is 32; older Cover path used 16 (half steps).
+DEFAULT_ODE_STEPS = 32
 
 _lock = threading.Lock()
 _pipe = None
@@ -89,8 +91,6 @@ def ensure_models():
         if not torch.cuda.is_bf16_supported():
             raise RuntimeError("GPU does not support BF16")
 
-        # SheetSage2 (remote code) before YuE2 — YuE2 custom modules can break
-        # transformers lazy imports that SheetSage2 still uses (4.45-style).
         AutoModel = _compat_transformers_exports()
         log(f"loading SheetSage2 {TRANSCRIBER_ID}")
         _transcriber = AutoModel.from_pretrained(
@@ -109,23 +109,43 @@ def ensure_models():
         return _pipe, _transcriber
 
 
-def transcribe_melody(audio_path: str) -> str:
+def transcribe_score(audio_path: str, *, melody_only: bool) -> str:
     _, transcriber = ensure_models()
-    log(f"transcribing melody from {audio_path}")
-    result = transcriber.transcribe(audio_path, melody_only=True)
+    log(f"transcribing score melody_only={melody_only} from {audio_path}")
+    result = transcriber.transcribe(audio_path, melody_only=bool(melody_only))
     abc = (result or {}).get("abc") if isinstance(result, dict) else None
     if not abc or not str(abc).strip():
-        raise RuntimeError("SheetSage2 did not produce melody ABC")
+        raise RuntimeError("SheetSage2 did not produce ABC score")
     return str(abc)
 
 
-def generate_cover(style: str, lyrics: str, abc: str, seed: int, ode_steps: int, cot: str):
+def generate_cover(
+    style: str,
+    lyrics: str,
+    abc: str,
+    seed: int,
+    ode_steps: int,
+    cot: str,
+    cfg_scale: float | None,
+):
     pipe, _ = ensure_models()
     original = pipe.generation_config
     pipe.generation_config = replace(original, ode_steps=int(ode_steps))
     try:
-        log(f"generating cover cot={cot} seed={seed} ode_steps={ode_steps}")
-        return pipe(style=style, lyrics=lyrics, abc=abc, cot=cot, seed=int(seed))
+        log(
+            f"generating cover cot={cot} seed={seed} ode_steps={ode_steps} "
+            f"cfg_scale={cfg_scale}"
+        )
+        kwargs = {
+            "style": style,
+            "lyrics": lyrics,
+            "abc": abc,
+            "cot": cot,
+            "seed": int(seed),
+        }
+        if cfg_scale is not None:
+            kwargs["cfg_scale"] = float(cfg_scale)
+        return pipe(**kwargs)
     finally:
         pipe.generation_config = original
 
@@ -137,20 +157,53 @@ def handler(event):
             ensure_models()
             return {"ok": True, "warm": True}
 
+        action = (inp.get("action") or "cover").strip().lower()
+        if action not in {"cover", "transcribe"}:
+            return {"error": "input.action must be cover or transcribe"}
+
         audio_url = inp.get("audio_url")
         abc = (inp.get("abc") or "").strip()
         style = (inp.get("style") or inp.get("style_prompt") or "").strip()
         lyrics = (inp.get("lyrics") or "").strip()
         cot = (inp.get("cot") or "melody").strip()
         seed = int(inp.get("seed", 831001))
-        ode_steps = int(inp.get("ode_steps", 16))
+        ode_steps = int(inp.get("ode_steps", DEFAULT_ODE_STEPS))
+        melody_only = bool(inp.get("melody_only", True if cot == "melody" else False))
+        cfg_raw = inp.get("cfg_scale", None)
+        cfg_scale = None if cfg_raw is None or cfg_raw == "" else float(cfg_raw)
 
+        if cot not in {"melody", "full", "off"}:
+            return {"error": "input.cot must be melody, full, or off"}
+        if ode_steps < 1 or ode_steps > 128:
+            return {"error": "ode_steps must be in [1, 128]"}
+        if cfg_scale is not None and not (0 <= cfg_scale <= 20):
+            return {"error": "cfg_scale must be in [0, 20]"}
+
+        # ---- 仅转谱：先出旋律/和弦谱，供前端审阅修改 ----
+        if action == "transcribe":
+            if not audio_url:
+                return {"error": "transcribe requires input.audio_url"}
+            in_audio = download_to_file(audio_url, suffix_from_url(audio_url))
+            try:
+                source_abc = transcribe_score(in_audio, melody_only=melody_only)
+            finally:
+                try:
+                    os.unlink(in_audio)
+                except OSError:
+                    pass
+            return {
+                "ok": True,
+                "action": "transcribe",
+                "abc": source_abc,
+                "source_abc": source_abc,
+                "melody_only": melody_only,
+            }
+
+        # ---- Cover：可用已有谱，或现场转谱后生成 ----
         if not style:
             return {"error": "Missing input.style or input.style_prompt"}
         if not lyrics:
             return {"error": "Missing input.lyrics"}
-        if cot not in {"melody", "full", "off"}:
-            return {"error": "input.cot must be melody, full, or off"}
         if not abc and not audio_url:
             return {"error": "Provide input.audio_url or input.abc"}
         if len(style) > 1000:
@@ -158,31 +211,45 @@ def handler(event):
         if len(lyrics) > 12000:
             return {"error": "lyrics must be <= 12000 characters"}
 
+        source_abc = abc
         in_audio = None
-        if not abc:
-            in_audio = download_to_file(audio_url, suffix_from_url(audio_url))
-            abc = transcribe_melody(in_audio)
+        try:
+            if not abc:
+                in_audio = download_to_file(audio_url, suffix_from_url(audio_url))
+                source_abc = transcribe_score(in_audio, melody_only=melody_only)
+                abc = source_abc
 
-        song = generate_cover(style, lyrics, abc, seed, ode_steps, cot)
+            song = generate_cover(style, lyrics, abc, seed, ode_steps, cot, cfg_scale)
 
-        work = Path(tempfile.mkdtemp(prefix="yue2-cover-"))
-        flac_path = work / "cover.flac"
-        mp3_path = work / "cover.mp3"
-        song.save(str(flac_path))
-        ffmpeg_to_mp3(str(flac_path), str(mp3_path))
-        audio_b64 = base64.b64encode(mp3_path.read_bytes()).decode("ascii")
+            work = Path(tempfile.mkdtemp(prefix="yue2-cover-"))
+            flac_path = work / "cover.flac"
+            mp3_path = work / "cover.mp3"
+            song.save(str(flac_path))
+            ffmpeg_to_mp3(str(flac_path), str(mp3_path))
+            audio_b64 = base64.b64encode(mp3_path.read_bytes()).decode("ascii")
 
-        return {
-            "ok": True,
-            "audio_base64": audio_b64,
-            "audio_mime": "audio/mpeg",
-            "abc": song.abc or abc,
-            "seed": seed,
-            "cot": cot,
-            "ode_steps": ode_steps,
-            "sample_rate": song.sample_rate,
-            "timing": song.timing,
-        }
+            result_abc = getattr(song, "abc", None) or abc
+            return {
+                "ok": True,
+                "action": "cover",
+                "audio_base64": audio_b64,
+                "audio_mime": "audio/mpeg",
+                "abc": result_abc,
+                "source_abc": source_abc,
+                "seed": seed,
+                "cot": cot,
+                "ode_steps": ode_steps,
+                "cfg_scale": cfg_scale,
+                "melody_only": melody_only,
+                "sample_rate": song.sample_rate,
+                "timing": song.timing,
+            }
+        finally:
+            if in_audio:
+                try:
+                    os.unlink(in_audio)
+                except OSError:
+                    pass
     except Exception as e:
         log("handler failed:\n" + traceback.format_exc())
         return {"error": str(e)}
