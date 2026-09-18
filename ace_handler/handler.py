@@ -56,12 +56,14 @@ def get_dit_handler():
             "ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft"
         )
         device = os.environ.get("ACESTEP_DEVICE", "cuda")
-        log(f"Loading DiT with config_path={config_path}")
-        _dit_handler.initialize_service(
+        status, ok = _dit_handler.initialize_service(
             project_root="/app/acestep-repo",
             config_path=config_path,
             device=device,
         )
+        log(f"DiT initialize_service => ok={ok} status={status} config={config_path}")
+        if not ok:
+            raise RuntimeError(f"DiT init failed: {status}")
         log(f"DiT model loaded in {time.time() - t0:.1f}s (config={config_path})")
     return _dit_handler
 
