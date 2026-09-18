@@ -52,7 +52,7 @@ def get_dit_handler():
         from acestep.handler import AceStepHandler
 
         _dit_handler = AceStepHandler()
-        config_path = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
+        config_path = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft")
         device = os.environ.get("ACESTEP_DEVICE", "cuda")
         _dit_handler.initialize_service(
             project_root="/app/acestep-repo",
@@ -61,6 +61,23 @@ def get_dit_handler():
         )
         log(f"DiT model loaded in {time.time() - t0:.1f}s (config={config_path})")
     return _dit_handler
+
+
+def _is_turbo(config_path: str) -> bool:
+    return "turbo" in (config_path or "").lower()
+
+
+def _default_steps(config_path: str) -> int:
+    # Official: turbo ~8; base/sft commonly 32-64 (XL-SFT table lists 50)
+    return 8 if _is_turbo(config_path) else 50
+
+
+def _default_shift(config_path: str) -> float:
+    return 3.0
+
+
+def _default_guidance(config_path: str) -> float:
+    return 1.0 if _is_turbo(config_path) else 7.0
 
 
 def upload_to_r2(file_path: str, r2_config: dict) -> Optional[str]:
@@ -147,6 +164,7 @@ def handler(event: dict) -> dict:
         r2_config = input_data.get("r2")
         log(f"[ace-patch] Task={task_type} handler=leidige-src_audio_fix")
 
+        config_path = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft")
         dit = get_dit_handler()
         t0 = time.time()
 
@@ -155,8 +173,7 @@ def handler(event: dict) -> dict:
         prompt = input_data.get("prompt", "") or ""
         lyrics = input_data.get("lyrics", "") or ""
         duration = float(input_data.get("audio_duration", 30))
-        # Turbo: more steps = less "MIDI sketch"; 8 is too drafty for product listen
-        steps = int(input_data.get("inference_steps", 24))
+        steps = int(input_data.get("inference_steps", _default_steps(config_path)))
         audio_format = input_data.get("audio_format", "mp3") or "mp3"
         seed = input_data.get("seed")
         if seed is None:
@@ -164,9 +181,8 @@ def handler(event: dict) -> dict:
         else:
             seed = int(seed)
 
-        # Turbo docs: shift=3.0; guidance_scale ignored/forced to 1.0
-        shift = float(input_data.get("shift", 3.0))
-        guidance_scale = float(input_data.get("guidance_scale", 7.0))
+        shift = float(input_data.get("shift", _default_shift(config_path)))
+        guidance_scale = float(input_data.get("guidance_scale", _default_guidance(config_path)))
 
         params = GenerationParams(
             task_type=task_type,
@@ -292,11 +308,13 @@ def handler(event: dict) -> dict:
             "handler": "leidige-src_audio_fix",
             "wired": {
                 "task_type": task_type,
+                "config_path": config_path,
                 "used_src_audio": bool(getattr(params, "src_audio", None)),
                 "used_reference_audio": bool(getattr(params, "reference_audio", None)),
                 "audio_cover_strength": float(getattr(params, "audio_cover_strength", 0)),
                 "inference_steps": steps,
                 "shift": shift,
+                "guidance_scale": guidance_scale,
             },
         }
         if actual_duration:

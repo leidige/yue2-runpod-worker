@@ -1,0 +1,26 @@
+# ACE-Step 1.5 XL-SFT serverless worker (quality tier).
+# Base image already has torch/acestep/LM/VAE; we add XL-SFT DiT + patched handler.
+#
+# Build (amd64 for RunPod):
+#   docker build --platform linux/amd64 -t ghcr.io/leidige/ace-step-handler:xl-sft -f ace_handler/Dockerfile.xl-sft .
+#   docker push ghcr.io/leidige/ace-step-handler:xl-sft
+FROM ghcr.io/conalmullan/video-toolkit-acestep:latest
+
+# XL-SFT DiT (~19GB). VAE / embedding / LM 1.7B already in base image.
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+print('Downloading ACE-Step XL-SFT DiT...'); \
+snapshot_download('ACE-Step/Ace-Step1.5', \
+  allow_patterns=['acestep-v15-xl-sft/*'], \
+  cache_dir='/root/.cache/huggingface'); \
+print('XL-SFT downloaded'); \
+"
+
+ENV ACESTEP_CONFIG_PATH=acestep-v15-xl-sft
+ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
+ENV ACESTEP_DEVICE=cuda
+ENV ACESTEP_INIT_LLM=false
+ENV PYTHONUNBUFFERED=1
+
+COPY ace_handler/handler.py /app/handler.py
+CMD ["python3", "-u", "/app/handler.py"]
