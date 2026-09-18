@@ -18,8 +18,8 @@ DOWNLOAD_HEADERS = {
 MAX_AUDIO_BYTES = 80 * 1024 * 1024
 MODEL_ID = os.environ.get("YUE2_MODEL", "m-a-p/YuE2-3B")
 TRANSCRIBER_ID = os.environ.get("SHEETSAGE_MODEL", "m-a-p/SheetSage2")
-# Official GenerationConfig default is 32; older Cover path used 16 (half steps).
-DEFAULT_ODE_STEPS = 32
+# Official GenerationConfig default is 32. Cover 默认略抬到 48 换听感余量。
+DEFAULT_ODE_STEPS = 48
 # 纯伴奏时略抬 CFG，让 Tags（instrumental / not applicable vocal）压过人声习惯
 DEFAULT_INSTRUMENTAL_CFG = 1.2
 _INSTRUMENTAL_STYLE_RE = re.compile(
@@ -35,7 +35,8 @@ _CHORD_QUOTE_RE = re.compile(
     r'(?:maj|min|dim|aug|sus|add|m|M)?'
     r'(?:[0-9]+)?(?:/[A-G](?:#|b)?)?\s*"'
 )
-_HANDLER_BUILD = "cover-5-vocal-melody-prep"
+_HANDLER_BUILD = "cover-6-official-dual-voice"
+
 
 _lock = threading.Lock()
 _pipe = None
@@ -340,9 +341,19 @@ def prepare_cover_abc(
     *,
     cot: str,
     instrumental: bool,
+    prefer_vocal_only: bool = False,
 ) -> tuple[str | None, dict]:
-    """Cover 谱预处理：清和弦 →（伴奏剥人声 / 人声优先 Vocal）。"""
-    info: dict = {"handler_build": _HANDLER_BUILD, "cot": cot, "instrumental": instrumental}
+    """Cover 谱预处理。
+
+    官方 Cover：melody_only 保留 Vocal+Ins、去掉和弦。默认不要剥 Ins。
+    仅纯伴奏才剥 Vocal；prefer_vocal_only 为实验开关。
+    """
+    info: dict = {
+        "handler_build": _HANDLER_BUILD,
+        "cot": cot,
+        "instrumental": instrumental,
+        "prefer_vocal_only": prefer_vocal_only,
+    }
     if not abc or not str(abc).strip():
         info["skipped"] = "empty_abc"
         return abc, info
@@ -354,9 +365,11 @@ def prepare_cover_abc(
     if instrumental:
         text, strip_meta = strip_vocal_voices_from_abc(text)
         info["abc_strip"] = strip_meta
-    elif cot == "melody":
+    elif prefer_vocal_only and cot == "melody":
         text, pref_meta = prefer_vocal_melody_abc(text)
         info["vocal_prefer"] = pref_meta
+    else:
+        info["voices"] = "keep_vocal_and_ins"
 
     info["note_lines"] = _count_note_lines(text.split("\n"))
     info["abc_chars"] = len(text)
@@ -523,7 +536,10 @@ def handler(event):
             try:
                 source_abc, tx_meta = transcribe_score(in_audio, melody_only=melody_only)
                 prepared, prep_meta = prepare_cover_abc(
-                    source_abc, cot="melody" if melody_only else "full", instrumental=False
+                    source_abc,
+                    cot="melody" if melody_only else "full",
+                    instrumental=False,
+                    prefer_vocal_only=bool(inp.get("prefer_vocal_only")),
                 )
             finally:
                 try:
@@ -598,7 +614,10 @@ def handler(event):
 
             if abc and str(abc).strip():
                 abc, cover_prep = prepare_cover_abc(
-                    abc, cot=cot, instrumental=instrumental
+                    abc,
+                    cot=cot,
+                    instrumental=instrumental,
+                    prefer_vocal_only=bool(inp.get("prefer_vocal_only")),
                 )
 
             if instrumental:
