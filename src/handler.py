@@ -35,7 +35,8 @@ _CHORD_QUOTE_RE = re.compile(
     r'(?:maj|min|dim|aug|sus|add|m|M)?'
     r'(?:[0-9]+)?(?:/[A-G](?:#|b)?)?\s*"'
 )
-_HANDLER_BUILD = "cover-6-official-dual-voice"
+_HANDLER_BUILD = "cover-7-slim-audio-return"
+
 
 
 _lock = threading.Lock()
@@ -668,17 +669,16 @@ def handler(event):
             except Exception:
                 out_seconds = probe_audio_seconds(str(mp3_path))
             trunc = getattr(song, "truncated", None)
-            return {
+
+            # RunPod status/output 有体积上限：长曲若同时塞 wav+flac base64 会被整包丢成 output=null
+            include_lossless = bool(inp.get("include_lossless"))
+            # ~7.5MiB raw ≈ 10MiB base64 安全线
+            MAX_B64_RAW = 7_500_000
+            payload: dict = {
                 "ok": True,
                 "action": "cover",
                 "handler_build": _HANDLER_BUILD,
-                # 试听默认 MP3；无损另附 WAV / FLAC
-                "audio_base64": base64.b64encode(mp3_bytes).decode("ascii"),
                 "audio_mime": "audio/mpeg",
-                "audio_wav_base64": base64.b64encode(wav_bytes).decode("ascii"),
-                "audio_wav_mime": "audio/wav",
-                "audio_flac_base64": base64.b64encode(flac_bytes).decode("ascii"),
-                "audio_flac_mime": "audio/flac",
                 "audio_bytes": {
                     "mp3": len(mp3_bytes),
                     "wav": len(wav_bytes),
@@ -701,6 +701,62 @@ def handler(event):
                 "sample_rate": song.sample_rate,
                 "timing": song.timing,
             }
+
+            if len(mp3_bytes) <= MAX_B64_RAW:
+                payload["audio_base64"] = base64.b64encode(mp3_bytes).decode("ascii")
+            else:
+                # 过大：落到临时公网 URL，避免 output 被平台丢弃
+                try:
+                    import requests as _req
+
+                    files = {
+                        "reqtype": (None, "fileupload"),
+                        "time": (None, "24h"),
+                        "fileToUpload": ("cover.mp3", mp3_bytes, "audio/mpeg"),
+                    }
+                    up = _req.post(
+                        "https://litterbox.catbox.moe/resources/internals/api.php",
+                        files=files,
+                        timeout=180,
+                    )
+                    url = (up.text or "").strip()
+                    if up.ok and url.startswith("http"):
+                        payload["audio_url"] = url
+                        payload["audio_delivery"] = "url"
+                        log(f"large mp3 via url bytes={len(mp3_bytes)} url={url}")
+                    else:
+                        raise RuntimeError(f"upload failed HTTP {up.status_code}: {url[:200]}")
+                except Exception as up_exc:
+                    log(f"url upload failed, truncating mp3 for base64: {up_exc}")
+                    # 最后手段：降码率再塞 base64
+                    small = work / "cover_small.mp3"
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-i", str(flac_path),
+                            "-codec:a", "libmp3lame", "-b:a", "96k",
+                            str(small),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    small_bytes = small.read_bytes()
+                    if len(small_bytes) > MAX_B64_RAW:
+                        small_bytes = small_bytes[:MAX_B64_RAW]
+                        payload["audio_truncated_warning"] = "mp3 truncated for transport"
+                    payload["audio_base64"] = base64.b64encode(small_bytes).decode("ascii")
+                    payload["audio_bytes"]["mp3"] = len(small_bytes)
+                    payload["audio_delivery"] = "base64_downsampled"
+
+            if include_lossless and len(wav_bytes) <= MAX_B64_RAW // 2:
+                payload["audio_wav_base64"] = base64.b64encode(wav_bytes).decode("ascii")
+                payload["audio_wav_mime"] = "audio/wav"
+            if include_lossless and len(flac_bytes) <= MAX_B64_RAW // 2:
+                payload["audio_flac_base64"] = base64.b64encode(flac_bytes).decode("ascii")
+                payload["audio_flac_mime"] = "audio/flac"
+
+            return payload
         finally:
             if in_audio:
                 try:
