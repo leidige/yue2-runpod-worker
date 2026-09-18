@@ -35,7 +35,7 @@ _CHORD_QUOTE_RE = re.compile(
     r'(?:maj|min|dim|aug|sus|add|m|M)?'
     r'(?:[0-9]+)?(?:/[A-G](?:#|b)?)?\s*"'
 )
-_HANDLER_BUILD = "cover-7-slim-audio-return"
+_HANDLER_BUILD = "cover-8-cot-full-chords"
 
 
 
@@ -346,8 +346,9 @@ def prepare_cover_abc(
 ) -> tuple[str | None, dict]:
     """Cover 谱预处理。
 
-    官方 Cover：melody_only 保留 Vocal+Ins、去掉和弦。默认不要剥 Ins。
-    仅纯伴奏才剥 Vocal；prefer_vocal_only 为实验开关。
+    - cot=melody：去掉和弦（官方换风格 Cover）
+    - cot=full：保留和弦，才能锁和声
+    - 纯伴奏：剥 Vocal，留 Ins
     """
     info: dict = {
         "handler_build": _HANDLER_BUILD,
@@ -360,8 +361,11 @@ def prepare_cover_abc(
         return abc, info
 
     text = str(abc)
-    text, chord_meta = strip_chord_symbols_from_abc(text)
-    info["chords"] = chord_meta
+    if cot == "melody":
+        text, chord_meta = strip_chord_symbols_from_abc(text)
+        info["chords"] = chord_meta
+    else:
+        info["chords"] = {"chord_quotes_removed": 0, "kept_for_full": True}
 
     if instrumental:
         text, strip_meta = strip_vocal_voices_from_abc(text)
@@ -568,13 +572,18 @@ def handler(event):
         if len(lyrics) > 12000:
             return {"error": "lyrics must be <= 12000 characters"}
 
-        # Cover 默认强制 melody + melody_only，避免误用 off/full 漂旋律
+        # Cover：cot 与转谱模式必须对齐
+        # - melody → SheetSage melody_only（无和弦）+ 清和弦
+        # - full   → SheetSage 完整谱（含和弦）+ 保留和弦
         has_ref = bool(abc) or bool(audio_url)
         if has_ref and cot not in {"melody", "full"}:
             log(f"cover: cot={cot} -> melody")
             cot = "melody"
         if has_ref and cot == "melody":
             melody_only = True
+        elif has_ref and cot == "full":
+            melody_only = False
+            log("cover: cot=full -> melody_only=False (keep chords)")
 
         source_abc = abc
         in_audio = None

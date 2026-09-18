@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 
 EP = "bdn7z6r6guv3ll"
-IMG = "ghcr.io/leidige/yue2-runpod-worker:cover-4"
+IMG = "ghcr.io/leidige/yue2-runpod-worker:cover-8"
 
 
 def req(method: str, url: str, key: str, body: dict | None = None) -> tuple[int, str]:

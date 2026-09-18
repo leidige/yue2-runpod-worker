@@ -47,13 +47,18 @@ def main() -> None:
     assert info["chords"]["chord_quotes_removed"] == 2
     assert info.get("voices") == "keep_vocal_and_ins"
     assert out and "V:Ins" in out and "V:Vocal" in out
+    assert '"C"' not in out
+
+    out_full, info_full = prepare_cover_abc(SAMPLE, cot="full", instrumental=False)
+    assert info_full["chords"].get("kept_for_full") is True
+    assert '"C"' in out_full and '"G"' in out_full
 
     out2, info2 = prepare_cover_abc(
         SAMPLE, cot="melody", instrumental=False, prefer_vocal_only=True
     )
     assert info2["vocal_prefer"]["preferred"] is True
     assert out2 and "V:Ins" not in out2
-    print("OK", info, info2)
+    print("OK", info, info_full, info2)
 
 
 if __name__ == "__main__":
