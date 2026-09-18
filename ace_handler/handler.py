@@ -52,8 +52,11 @@ def get_dit_handler():
         from acestep.handler import AceStepHandler
 
         _dit_handler = AceStepHandler()
-        config_path = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft")
+        config_path = os.environ.get("ACE_FORCE_CONFIG") or os.environ.get(
+            "ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft"
+        )
         device = os.environ.get("ACESTEP_DEVICE", "cuda")
+        log(f"Loading DiT with config_path={config_path}")
         _dit_handler.initialize_service(
             project_root="/app/acestep-repo",
             config_path=config_path,
@@ -164,12 +167,23 @@ def handler(event: dict) -> dict:
         r2_config = input_data.get("r2")
         log(f"[ace-patch] Task={task_type} handler=leidige-src_audio_fix")
 
-        config_path = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft")
+        config_path = os.environ.get("ACE_FORCE_CONFIG") or os.environ.get(
+            "ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft"
+        )
+        if "turbo" in config_path.lower() and os.environ.get("ACE_FORCE_CONFIG"):
+            return {
+                "error": f"refusing turbo config under ACE_FORCE_CONFIG: {config_path}",
+                "handler": "leidige-src_audio_fix",
+            }
         dit = get_dit_handler()
         t0 = time.time()
 
         from acestep.inference import GenerationParams, GenerationConfig, generate_music
 
+        # Re-read after model load (get_dit_handler uses env)
+        config_path = os.environ.get("ACE_FORCE_CONFIG") or os.environ.get(
+            "ACESTEP_CONFIG_PATH", "acestep-v15-xl-sft"
+        )
         prompt = input_data.get("prompt", "") or ""
         lyrics = input_data.get("lyrics", "") or ""
         duration = float(input_data.get("audio_duration", 30))
