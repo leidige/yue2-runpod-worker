@@ -29,6 +29,13 @@ _INSTRUMENTAL_STYLE_RE = re.compile(
 )
 _VOICE_HEADER_RE = re.compile(r"^V:\s*(.+)$", re.I)
 _NOTE_LINE_RE = re.compile(r"[A-Ga-g]")
+# ABC quoted chord symbols e.g. "Am7" "G/B" — remove for cot=melody covers
+_CHORD_QUOTE_RE = re.compile(
+    r'"\s*[A-G](?:#|b)?'
+    r'(?:maj|min|dim|aug|sus|add|m|M)?'
+    r'(?:[0-9]+)?(?:/[A-G](?:#|b)?)?\s*"'
+)
+_HANDLER_BUILD = "cover-5-vocal-melody-prep"
 
 _lock = threading.Lock()
 _pipe = None
@@ -200,6 +207,23 @@ def _voice_is_vocal(header_body: str) -> bool:
     return token in {"vocal", "vocals", "voice", "singer", "vox"}
 
 
+def _count_note_lines(lines: list[str]) -> int:
+    return sum(
+        1
+        for ln in lines
+        if _NOTE_LINE_RE.search(ln) and not ln.strip().startswith("%") and not ln.strip().startswith("w:")
+    )
+
+
+def strip_chord_symbols_from_abc(abc: str) -> tuple[str, dict]:
+    """去掉 ABC 引号和弦标注，避免 cot=melody 时把和声符号当旋律条件。"""
+    raw = abc or ""
+    cleaned, n = _CHORD_QUOTE_RE.subn("", raw)
+    # 压缩因删和弦留下的多余空格（保留换行）
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned, {"chord_quotes_removed": int(n)}
+
+
 def strip_vocal_voices_from_abc(abc: str) -> tuple[str, dict]:
     """纯伴奏 Cover：去掉 Vocal 声部，只留 Ins/器乐旋律，避免模型跟着人声线哼唱。
 
@@ -234,7 +258,7 @@ def strip_vocal_voices_from_abc(abc: str) -> tuple[str, dict]:
         out.append(line)
 
     text = "\n".join(out).strip() + ("\n" if raw.endswith("\n") else "")
-    note_lines = sum(1 for ln in out if _NOTE_LINE_RE.search(ln) and not ln.strip().startswith("%"))
+    note_lines = _count_note_lines(out)
     meta = {
         "stripped": dropped_vocal,
         "saw_voice_headers": saw_voice,
@@ -249,6 +273,95 @@ def strip_vocal_voices_from_abc(abc: str) -> tuple[str, dict]:
     if not dropped_vocal:
         meta["reason"] = "no_vocal_voice_header"
     return text, meta
+
+
+def prefer_vocal_melody_abc(abc: str) -> tuple[str, dict]:
+    """人声 Cover：若谱里同时有 Vocal + Ins，只保留 Vocal 主旋律线。
+
+    官方建议 Cover 先选定人声/主旋律再渲染；双声部一起锁容易漂。
+    """
+    raw = (abc or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not raw.strip():
+        return raw, {"preferred": False, "reason": "empty"}
+
+    lines = raw.split("\n")
+    has_vocal = False
+    has_other = False
+    for line in lines:
+        m = _VOICE_HEADER_RE.match(line.strip())
+        if not m:
+            continue
+        if _voice_is_vocal(m.group(1)):
+            has_vocal = True
+        else:
+            has_other = True
+
+    if not (has_vocal and has_other):
+        return abc, {
+            "preferred": False,
+            "reason": "single_or_no_voice",
+            "has_vocal": has_vocal,
+            "has_other": has_other,
+            "note_lines_after": _count_note_lines(lines),
+        }
+
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        m = _VOICE_HEADER_RE.match(line.strip())
+        if m:
+            if _voice_is_vocal(m.group(1)):
+                skipping = False
+                out.append(line)
+            else:
+                skipping = True
+            continue
+        if skipping:
+            continue
+        out.append(line)
+
+    note_lines = _count_note_lines(out)
+    meta = {
+        "preferred": True,
+        "kept": "vocal",
+        "dropped_other_voices": True,
+        "note_lines_after": note_lines,
+    }
+    if note_lines < 4:
+        meta["preferred"] = False
+        meta["reason"] = "fallback_too_few_notes"
+        return abc, meta
+    text = "\n".join(out).strip() + ("\n" if raw.endswith("\n") else "")
+    return text, meta
+
+
+def prepare_cover_abc(
+    abc: str | None,
+    *,
+    cot: str,
+    instrumental: bool,
+) -> tuple[str | None, dict]:
+    """Cover 谱预处理：清和弦 →（伴奏剥人声 / 人声优先 Vocal）。"""
+    info: dict = {"handler_build": _HANDLER_BUILD, "cot": cot, "instrumental": instrumental}
+    if not abc or not str(abc).strip():
+        info["skipped"] = "empty_abc"
+        return abc, info
+
+    text = str(abc)
+    text, chord_meta = strip_chord_symbols_from_abc(text)
+    info["chords"] = chord_meta
+
+    if instrumental:
+        text, strip_meta = strip_vocal_voices_from_abc(text)
+        info["abc_strip"] = strip_meta
+    elif cot == "melody":
+        text, pref_meta = prefer_vocal_melody_abc(text)
+        info["vocal_prefer"] = pref_meta
+
+    info["note_lines"] = _count_note_lines(text.split("\n"))
+    info["abc_chars"] = len(text)
+    log(f"cover abc prep={info}")
+    return text, info
 
 
 def prepare_instrumental_cover(
@@ -273,14 +386,61 @@ def prepare_instrumental_cover(
     return abc_out, cfg_out, info
 
 
-def transcribe_score(audio_path: str, *, melody_only: bool) -> str:
+def preprocess_audio_for_transcribe(src: str) -> str:
+    """转谱前规范化：定响度 + 44.1k 立体声 WAV，降低 SheetSage 抓飘概率。"""
+    fd, dst = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", src,
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-ar", "44100", "-ac", "2",
+                dst,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        log(f"preprocess wav ready bytes={os.path.getsize(dst)}")
+        return dst
+    except Exception as exc:
+        log(f"preprocess failed, use original: {exc}")
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        return src
+
+
+def transcribe_score(audio_path: str, *, melody_only: bool) -> tuple[str, dict]:
     _, transcriber = ensure_models()
-    log(f"transcribing score melody_only={melody_only} from {audio_path}")
-    result = transcriber.transcribe(audio_path, melody_only=bool(melody_only))
-    abc = (result or {}).get("abc") if isinstance(result, dict) else None
-    if not abc or not str(abc).strip():
-        raise RuntimeError("SheetSage2 did not produce ABC score")
-    return str(abc)
+    clean = preprocess_audio_for_transcribe(audio_path)
+    cleanup_clean = clean != audio_path
+    try:
+        log(f"transcribing score melody_only={melody_only} from {clean}")
+        result = transcriber.transcribe(clean, melody_only=bool(melody_only))
+        if not isinstance(result, dict):
+            raise RuntimeError("SheetSage2 returned non-dict result")
+        abc = result.get("abc")
+        if result.get("abc_error"):
+            raise RuntimeError(f"SheetSage2 abc_error: {result.get('abc_error')}")
+        if not abc or not str(abc).strip():
+            raise RuntimeError("SheetSage2 did not produce ABC score")
+        meta = {
+            "warnings": result.get("warnings") or [],
+            "melody_only": bool(melody_only),
+            "preprocessed": cleanup_clean,
+            "abc_chars_raw": len(str(abc)),
+        }
+        return str(abc), meta
+    finally:
+        if cleanup_clean:
+            try:
+                os.unlink(clean)
+            except OSError:
+                pass
 
 
 def generate_cover(
@@ -331,7 +491,7 @@ def handler(event):
     try:
         if inp.get("warmup"):
             ensure_models()
-            return {"ok": True, "warm": True}
+            return {"ok": True, "warm": True, "handler_build": _HANDLER_BUILD}
 
         action = (inp.get("action") or "cover").strip().lower()
         if action not in {"cover", "transcribe"}:
@@ -361,7 +521,10 @@ def handler(event):
                 return {"error": "transcribe requires input.audio_url"}
             in_audio = download_to_file(audio_url, suffix_from_url(audio_url))
             try:
-                source_abc = transcribe_score(in_audio, melody_only=melody_only)
+                source_abc, tx_meta = transcribe_score(in_audio, melody_only=melody_only)
+                prepared, prep_meta = prepare_cover_abc(
+                    source_abc, cot="melody" if melody_only else "full", instrumental=False
+                )
             finally:
                 try:
                     os.unlink(in_audio)
@@ -370,9 +533,12 @@ def handler(event):
             return {
                 "ok": True,
                 "action": "transcribe",
-                "abc": source_abc,
+                "abc": prepared or source_abc,
                 "source_abc": source_abc,
                 "melody_only": melody_only,
+                "transcribe_meta": tx_meta,
+                "cover_prep": prep_meta,
+                "handler_build": _HANDLER_BUILD,
             }
 
         # ---- 生成：可 Cover（音频/谱），也可纯风格+歌词文生曲 ----
@@ -385,16 +551,28 @@ def handler(event):
         if len(lyrics) > 12000:
             return {"error": "lyrics must be <= 12000 characters"}
 
+        # Cover 默认强制 melody + melody_only，避免误用 off/full 漂旋律
+        has_ref = bool(abc) or bool(audio_url)
+        if has_ref and cot not in {"melody", "full"}:
+            log(f"cover: cot={cot} -> melody")
+            cot = "melody"
+        if has_ref and cot == "melody":
+            melody_only = True
+
         source_abc = abc
         in_audio = None
         source_seconds: float | None = None
+        transcribe_meta: dict = {}
+        cover_prep: dict = {}
         try:
             if not abc and audio_url:
                 in_audio = download_to_file(audio_url, suffix_from_url(audio_url))
                 source_seconds = probe_audio_seconds(in_audio)
                 if source_seconds:
                     log(f"reference audio duration={source_seconds:.1f}s")
-                source_abc = transcribe_score(in_audio, melody_only=melody_only)
+                source_abc, transcribe_meta = transcribe_score(
+                    in_audio, melody_only=melody_only
+                )
                 abc = source_abc
             elif not abc and not audio_url:
                 # 文生曲：不锁参考旋律；melody 无谱时改用 full 让模型自己规划
@@ -417,13 +595,22 @@ def handler(event):
                 style, lyrics, inp.get("force_instrumental") or inp.get("instrumental")
             )
             instrumental_meta: dict = {"instrumental": instrumental}
+
+            if abc and str(abc).strip():
+                abc, cover_prep = prepare_cover_abc(
+                    abc, cot=cot, instrumental=instrumental
+                )
+
             if instrumental:
-                abc, cfg_scale, instrumental_meta = prepare_instrumental_cover(
+                # prepare_cover_abc 已剥 Vocal；这里只补 cfg / 歌词结构
+                _, cfg_scale, instrumental_meta = prepare_instrumental_cover(
                     style=style,
                     lyrics=lyrics,
-                    abc=abc if abc else None,
+                    abc=None,
                     cfg_scale=cfg_scale,
                 )
+                if cover_prep:
+                    instrumental_meta["cover_prep"] = cover_prep
                 # 空词段太少 → 时长塌缩；按时长加铺结构
                 lyrics = expand_instrumental_lyrics_for_duration(source_seconds)
                 instrumental_meta["lyrics_expanded_for_duration"] = True
@@ -465,6 +652,7 @@ def handler(event):
             return {
                 "ok": True,
                 "action": "cover",
+                "handler_build": _HANDLER_BUILD,
                 # 试听默认 MP3；无损另附 WAV / FLAC
                 "audio_base64": base64.b64encode(mp3_bytes).decode("ascii"),
                 "audio_mime": "audio/mpeg",
@@ -486,6 +674,8 @@ def handler(event):
                 "melody_only": melody_only,
                 "instrumental": instrumental,
                 "instrumental_meta": instrumental_meta,
+                "transcribe_meta": transcribe_meta,
+                "cover_prep": cover_prep,
                 "source_seconds": source_seconds,
                 "output_seconds": out_seconds,
                 "truncated": trunc,
@@ -500,7 +690,6 @@ def handler(event):
                     pass
     except Exception as e:
         log("handler failed:\n" + traceback.format_exc())
-        return {"error": str(e)}
-
+        return {"error": str(e), "handler_build": _HANDLER_BUILD}
 
 runpod.serverless.start({"handler": handler})
